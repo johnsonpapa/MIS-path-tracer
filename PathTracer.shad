@@ -1,0 +1,1323 @@
+/* TODO list:
+1) Rendering scene
+3) Auxilliary features with importance in the order of: Textures, Bezier curve/interpolation of normals of the plane, BVH collision optimisation, UI, etc. */
+
+/*
+	Assumptions for this shader:
+	All models are centred on position (0, 0, 0) relatively
+*/
+
+#version 430 compatibility
+
+// ----------- CONSTANTS AND MACROS -----------
+#define PI 3.1415926535897932384626433832795 // Pi
+#define e 2.718281828459045235360287471352 // Euler's number
+
+// Macro for path tracing branching factors
+#define maxDepth ###MAXDEPTH### // Determines what sample is the compute shader currently calculating
+#define directLightSpp ###NEE_DIRECT_LIGHT###
+#define indirectLightSpp ###NEE_INDIRECT_LIGHT###
+
+// Macro for general path tracing
+#define DISTANCE_METRIC ###DISTANCEMETRIC### // Determines unit distance per pixel
+#define EPSILON 0.001 // Very small value
+#define RAY_DIR_CUTOFF_ANGLE 0.02 // The cut off angle for reflection, 0.02 approximates to 88.57 degrees. Note that this value is arbitrary.
+#define areaLightHitAttempts ###AREA_LIGHT_HIT_ATTEMPTS###
+
+// Macro for Russian Roulette
+#define russian_roulette ###RUSSIAN_ROULETTE###
+
+// Default refractive index macro
+#define defaultRefractiveIndex 1.0003 // Air
+// #define defaultRefractiveIndex 1 // Vacuum
+
+// Macro for sampling BSDF
+// #define BECKMANN_BSDF // Not implemented
+#define GGX_BSDF
+
+// Macro for collision handling
+#define ###COLLISION_MODE###
+// #define COLLISION_BRUTE_FORCE // Recommended for low polygon  count
+// #define COLLISION_BVH_TRAVERSAL // Recommended for high polygon count
+
+// Macro for BVH
+#define treeSearchDepth ###BVH_TREE_DEPTH### // Determines the tree depth explorable/recordable
+#define TRIANGLES_PER_GROUP ###NOOFTRIANGLES### // Number of triangle per BVH leaf node
+
+// ----------- STRUCTS -----------
+struct Settings {
+	int totalSampleNumber, sampleNumber, startingSeed;
+};
+
+/** Struct representing information about a model */
+struct Model {
+	// Index references to data stored in the uniform (low overhead in a sense)
+    int verticesStartIndex, verticesEndIndex;
+	
+	// Material component variables
+	float diffuseComponent, // Diffuse component
+			specularComponent, // Specular component
+			transparentComponent, // Transparent component
+			roughness, // Parameter for BRDF
+			refractiveIndex, // For Transparent component
+			albedo; // For diffuse component
+    int material, // Dielectric or conductor
+		textureID; // Texture ID
+	
+	// Colour
+	float r, g, b;
+	float lightStrength; // Emittance of light
+	
+	// Centre positions
+	float cx, cy, cz;
+	
+	// Beer's law absorption
+	float absorption[3];
+	
+	// Bounding positions
+	float bpMinX, bpMinY, bpMinZ;
+	float bpMaxX, bpMaxY, bpMaxZ;
+};
+
+/** Struct representing the camera */
+struct Camera {
+	vec3 viewerPosition; // From the screen, determines perspective
+	vec3 cameraPosition; // Camera position
+	mat4 cameraRotation; // Rotation matrix for the camera
+};
+
+/** Struct representing the ray itself */
+struct Ray {
+	vec3 position; // Where the ray starts
+	vec3 direction; // Direction of ray
+	vec4 colour; // Gathered light colour
+	vec4 weight; // For importance sampling
+	float refractedDistance; // For beer's law
+	float distance; // For distance falloff
+	float bsdfPDF; // For NEE direct light sampling
+	bool isSpecularRay;
+	
+	// Colour to be stored for MIS
+	vec4 colourToBeAdded;
+	float colourToBeAddedBsdfPDF;
+};
+
+struct BVHNode {
+	int left, right;
+    int primitiveGroupID;
+    float bpMinX, bpMinY, bpMinZ;
+	float bpMaxX, bpMaxY, bpMaxZ;
+};
+
+struct PrimitiveGroup {
+	int primitiveID[###NOOFTRIANGLES###];
+	int primitiveType[###NOOFTRIANGLES###]; // 1 = Plane, 2 = Bezier curve
+};
+
+struct BVHNodeEntry
+{
+	int nodeID;
+	float distance;
+};
+
+// ----------- VARIABLES -----------
+// Local variables
+int intersectedModels[maxDepth];
+BVHNodeEntry bvhNodesToExplore[treeSearchDepth]; // Supports tree of depth N + 1
+float seed;
+
+// Uniform variables
+layout (local_size_x =  ##LOCALSIZEX##, local_size_y =  ##LOCALSIZEY##) in;
+layout (rgba32f, binding = 0) uniform image2D imageOutput; // Output image to be written to by the compute shader
+uniform Settings settings; // Settings for ths shader
+uniform Camera camera; // Camera
+
+// SSBOs
+layout (std430, binding = 1) buffer model_data{Model models[ ];};
+layout (std430, binding = 2) buffer vertex_data{vec4 vertices[ ];}; // Each vertex = x y z modelID, and is a triangular face
+layout (std430, binding = 3) buffer normal_data{vec4 normals[ ];}; // Each normal = x y z modelID, one per triangle in order
+layout (std430, binding = 4) buffer texCoord_data{vec2 texCoords[ ];}; // Each texCoord = tx ty
+layout (std430, binding = 5) buffer light_data{int lightSources[ ];}; // Each entry = modelID to indicate that it's a light source
+layout (std430, binding = 6) buffer bvh_data{BVHNode bvhNodes[ ];}; // See struct implementation
+layout (std430, binding = 7) buffer primitive_group_data{PrimitiveGroup primitiveGroups[ ];}; // For BVH, see struct implementation
+
+// ----------- FUNCTIONS -----------
+// ################# RNG
+// Adapted from: https://stackoverflow.com/questions/4200224/random-noise-functions-for-glsl?utm_medium=organic&utm_source=google_rich_qa&utm_campaign=google_rich_qa
+float RNG(){return abs(fract(cos(seed++) * 65269));}
+
+/* RNG function that disallows 1 */
+float RNGwithout1()
+{
+	float value = 1.0f;
+	while (value == 1)
+		value = RNG();
+	return value;
+}
+
+float getDistanceAttenuation(float distance)
+{
+	distance *= DISTANCE_METRIC;
+	float value = 1.0f / distance / distance;
+	if (value > 1)
+		return 1;
+	else return value;
+}
+
+// ################# Utility functions
+vec4 getModelColour(int id){return vec4(models[id].r, models[id].g, models[id].b, 1);}
+vec3 getMinBoundingPosition(int i){return vec3(models[i].bpMinX, models[i].bpMinY, models[i].bpMinZ);}
+vec3 getMaxBoundingPosition(int i){return vec3(models[i].bpMaxX, models[i].bpMaxY, models[i].bpMaxZ);}
+vec3 getBVHNodeMinBoundingPosition(int i){return vec3(bvhNodes[i].bpMinX, bvhNodes[i].bpMinY, bvhNodes[i].bpMinZ);}
+vec3 getBVHNodeMaxBoundingPosition(int i){return vec3(bvhNodes[i].bpMaxX, bvhNodes[i].bpMaxY, bvhNodes[i].bpMaxZ);}
+vec3 getCentrePosition(int i){return vec3(models[i].cx, models[i].cy, models[i].cz);}
+vec3 halfVector(vec3 v1, vec3 v2){return normalize((v1 + v2) / 2);}
+
+/**
+	Calculates the solid angle given the cone base area and the radius
+*/
+float getSolidAngle(float area, float d)
+{
+	d *= DISTANCE_METRIC;
+	float value = area / (d * d); // area / distance^2
+	return value;
+}
+
+float getRadiusAroundBoundingBox(int id)
+{
+	// Find distance between the bounding box vertices, then divided by 2
+	return distance(getMinBoundingPosition(id), getMaxBoundingPosition(id)) / 2;
+}
+
+// ################# Recording of intersected models functions
+void storeIntersectedModel(int modelID)
+{
+	for (int i = 0; i < maxDepth; i++)
+    {
+		if (intersectedModels[i] == -1)
+        {
+			intersectedModels[i] = modelID;
+			return;
+        }
+	}
+}
+    
+int getLastIntersectedModel()
+{
+    for (int i = maxDepth - 1; i >= 0; i--)
+    {
+		if (intersectedModels[i] != -1)
+        return intersectedModels[i];
+    }
+    return -1; // Nothing found, return -1
+}
+    
+float getLastIntersectedModelRefractiveIndex()
+{
+    for (int i = maxDepth - 1; i >= 0; i--)
+		if (intersectedModels[i] != -1)
+			return models[intersectedModels[i]].refractiveIndex;
+    return defaultRefractiveIndex; // Nothing found, return -1
+}
+    
+float getSecondLastIntersectedModelRefractiveIndex()
+{
+	bool firstFound = false;
+    for (int i = maxDepth - 1; i >= 0; i--)
+		if (intersectedModels[i] != -1)
+        {
+			if (!firstFound)
+				firstFound = true;
+			else return models[intersectedModels[i]].refractiveIndex;
+		}
+	return defaultRefractiveIndex; // Nothing found, return -1
+}
+    
+void removeLastIntersectedModel()
+{
+	for (int i = maxDepth - 1; i >= 0; i--)
+	{
+		if (intersectedModels[i] != -1)
+		{
+			intersectedModels[i] = -1;
+			return;
+		}
+	}
+}
+
+// ################# Record BVH nodes to be explored in the tree traversal
+void pushBVHNode(int nodeID, float distance)
+{
+	// Error handling
+	if (bvhNodesToExplore[0].nodeID == -2) return;
+	
+	for (int i = 0; i < treeSearchDepth; i++)
+		if (bvhNodesToExplore[i].nodeID == -1)
+		{
+			bvhNodesToExplore[i] = BVHNodeEntry(nodeID, distance);
+			return;
+		}
+	
+	// None stored -> Error
+	bvhNodesToExplore[0].nodeID = -2;
+}
+
+/** Called during backtrack in tree traversal */
+BVHNodeEntry popBVHNode()
+{
+	// Error handling
+	if (bvhNodesToExplore[0].nodeID == -2) return BVHNodeEntry(-1, -1);
+	
+	// Search the last stored BVHNode ID
+	for (int i = treeSearchDepth - 1; i >= 0; i--)
+	{
+		if (bvhNodesToExplore[i].nodeID != -1)
+		{
+			BVHNodeEntry result = bvhNodesToExplore[i];
+			bvhNodesToExplore[i] = BVHNodeEntry(-1, -1);
+			return result;
+		}
+	}
+	// Else none found
+	return BVHNodeEntry(-1, -1);
+}
+
+void clearBVHNodes()
+{
+	// Error handling
+	if (bvhNodesToExplore[0].nodeID == -2) return;
+	
+	// Set everything to -1
+	for (int i = 0; i < treeSearchDepth; i++)
+		bvhNodesToExplore[i] = BVHNodeEntry(-1, -1);
+}
+// ################# Intersection functions
+/** 
+	Method for testing collision against a bounding box 
+	TODO: Current method is naive, needs optimisation
+*/
+bool intersectsBoundingBox(Ray ray, vec3 minBoundingPosition, vec3 maxBoundingPosition, out float distance)
+{
+	// Get t value for the ray's x axis to intersect with the box
+	float txMin = (minBoundingPosition.x - ray.position.x) / ray.direction.x;
+	float txMax = (maxBoundingPosition.x - ray.position.x) / ray.direction.x;
+	if (txMin > txMax)
+	{
+		float temp = txMin;
+		txMin = txMax;
+		txMax = temp;
+	}
+
+	// Get t value for the ray's y axis to intersect with the box
+	float tyMin = (minBoundingPosition.y - ray.position.y) / ray.direction.y;
+	float tyMax = (maxBoundingPosition.y - ray.position.y) / ray.direction.y;
+	if (tyMin > tyMax)
+	{
+		float temp = tyMin;
+		tyMin = tyMax;
+		tyMax = temp;
+	}
+
+	// Get t value for the ray's z axis to intersect with the box
+	float tzMin = (minBoundingPosition.z - ray.position.z) / ray.direction.z;
+	float tzMax = (maxBoundingPosition.z - ray.position.z) / ray.direction.z;
+	if (tzMin > tzMax)
+	{
+		float temp = tzMin;
+		tzMin = tzMax;
+		tzMax = temp;
+	}
+	
+	// Disallow negative boxes to be intersected
+	if (txMin < 0 && txMax < 0 || tyMin < 0 && tyMax < 0 || tzMin < 0 && tzMax < 0) return false;
+	
+	// Ray doesn't intersect with box if t value at the y and z axis is not within bounds with x
+	if (tyMax < txMin || tyMin > txMax || tzMax < txMin || tzMin > txMax) return false;
+
+	// Ray doesn't intersect with box if t value at the x and z axis is not within bounds with y
+	if (txMax < tyMin || txMin > tyMax || tzMax < tyMin || tzMin > tyMax) return false;
+
+	// Ray doesn't intersect with box if t value at the y and x axis is not within bounds with z
+	if (tyMax < tzMin || tyMin > tzMax || txMax < tzMin || txMin > tzMax) return false;
+
+	// Output the largest tMin as the closest distance possible to bounding box
+	distance = max(txMin, max(tyMin, tzMin));
+	
+	return true;
+}
+
+/**
+	Method for testing collision between ray and triangular plane
+	Moller Trumbore algorithm from Scratch a Pixel
+	Don't really understand it yet, will learn before presentation or somethinghttps://www.scratchapixel.com/lessons/3d-basic-rendering/ray-tracing-rendering-a-triangle/moller-trumbore-ray-triangle-intersection
+    */
+void intersectsTriangle(Ray ray, vec3 v1, vec3 v2, vec3 v3, inout float t, out bool frontFacingTriangleHit)
+{
+	// Default value
+	t = -1.0f;
+
+	vec3 v0v1 = v2 - v1;
+	vec3 v0v2 = v3 - v1;
+	vec3 pvec = cross(ray.direction, v0v2);
+	float det = dot(v0v1, pvec);
+	
+	// Test if collision is with back facing or front facing triangle
+	if (det < 0) frontFacingTriangleHit = false; // Back face hit
+	else frontFacingTriangleHit = true; // Front face hit
+
+	float invDet = 1.0f/det;
+
+	vec3 tvec = ray.position - v1;
+	float u = dot(tvec, pvec) * invDet;
+	if (u < 0 || u > 1) return;
+
+	vec3 qvec = cross(tvec, v0v1);
+	float v = dot(ray.direction, qvec) * invDet;
+	if (v < 0 || u + v > 1) return;
+
+	t = dot(v0v2, qvec) * invDet;
+
+	if (t <= 0) t = -1; // No negative rays
+}
+
+/**
+	Ray collision test method using naive BVH tree traversal
+	For finding the closest collided plane, the closest model, and the intersected plane ID
+    */
+void rayCollisionTest(inout Ray ray,
+						inout int closestModel, // Records the closest model hit
+						inout int intersectedPlaneID, // Records the triangular plane where the ray hit
+						out vec3 intersectionPoint, // Records the point of intersection
+						out bool frontFacingTriangleHit) // Indicates if the triangle hit is front or back facing
+{
+	// Variable declarations
+	float closestDistance = 99999999; // Infinity distance -> Set the float to a really large number
+	float t;
+	bool testFrontFaceHit;
+	
+	// Traverse the BVH tree
+	#ifdef COLLISION_BVH_TRAVERSAL
+	int currentNode = 0; // Start at root node
+	bool leftHit, rightHit, modelIntersected;
+	float tl, tr;
+	while (currentNode != -1)
+	{
+		if (bvhNodes[currentNode].primitiveGroupID == -1)
+		{
+			// Branch node -> Traverse through the tree
+			// 1) Test collision with left and right children
+			leftHit = intersectsBoundingBox(ray, getBVHNodeMinBoundingPosition(bvhNodes[currentNode].left), getBVHNodeMaxBoundingPosition(bvhNodes[currentNode].left), tl);
+			rightHit = intersectsBoundingBox(ray, getBVHNodeMinBoundingPosition(bvhNodes[currentNode].right), getBVHNodeMaxBoundingPosition(bvhNodes[currentNode].right), tr);
+			
+			// Check if left/right bound box is occluded by checking with closestDistance so far
+			if (tl > closestDistance) leftHit = false;
+			if (tr > closestDistance) rightHit = false;
+			
+			if (leftHit)
+			{
+				if (rightHit)
+				{
+					// Both hit -> One of them is chosen and the other stored
+					if (tl < tr) // Left is closer
+					{
+						pushBVHNode(bvhNodes[currentNode].right, tr);
+						currentNode = bvhNodes[currentNode].left;
+					}
+					else if (tr < tl) // Right is closer
+					{
+						pushBVHNode(bvhNodes[currentNode].left, tl);
+						currentNode = bvhNodes[currentNode].right;
+					}
+					else
+					{
+						// Choose one at random
+						if (RNGwithout1() > 0.5)
+						{
+							pushBVHNode(bvhNodes[currentNode].right, tr);
+							currentNode = bvhNodes[currentNode].left;
+						}
+						else
+						{
+							pushBVHNode(bvhNodes[currentNode].left, tl);
+							currentNode = bvhNodes[currentNode].right;
+						}
+					}
+				}
+				else currentNode = bvhNodes[currentNode].left; // Only left hit
+			}
+			else if (rightHit) currentNode = bvhNodes[currentNode].right; // Only right hit
+			else // Nothing hit -> Backtrack
+			{
+				// Continually extract entries iff next entry distance >= closest distance found
+				BVHNodeEntry lastEntry;
+				do lastEntry = popBVHNode();
+				while (lastEntry.distance > closestDistance && lastEntry.nodeID != -1);
+				currentNode = lastEntry.nodeID;
+			}
+		}
+		else
+		{
+			// Is leaf node -> Attempt to intersect with the triangles
+			modelIntersected = false;
+			
+			// For each triangle in the group check for collision
+			int index = -1;
+			for (int i = 0; i < TRIANGLES_PER_GROUP; i++)
+			{
+				// Retrieve the index
+				index = primitiveGroups[bvhNodes[currentNode].primitiveGroupID].primitiveID[i];
+				
+				if (index != -1)
+				{
+					index *= 3; // 3 vertices per triangle
+					
+					// Check for intersection between ray and triangle
+					if (dot(ray.direction, normals[index].xyz) != 0) // Enforce that the ray can't hit the plane at 90/-270 degrees
+						intersectsTriangle(ray, vertices[index].xyz, vertices[index + 1].xyz, vertices[index + 2].xyz, t, testFrontFaceHit);
+					
+					// If a closest distance is found
+					// Small offset added to prevent intersecting the already intersected plane
+					if (t >= 0.005f && t < closestDistance)
+					{
+						// Update the closest distance and model
+						closestModel = int(vertices[index][3]);
+						intersectedPlaneID = index;
+						closestDistance = t;
+						frontFacingTriangleHit = testFrontFaceHit;
+						modelIntersected = true;
+					}
+				}
+			}
+			
+			// If no intersection with model, then backtrack
+			if (!modelIntersected)
+			{
+				// Continually extract entries iff next entry distance >= closest distance found
+				BVHNodeEntry lastEntry;
+				do lastEntry = popBVHNode();
+				while (lastEntry.distance > closestDistance && lastEntry.nodeID != -1);
+				currentNode = lastEntry.nodeID;
+			}
+		}
+	}
+	// Clear the BVHNode stack
+	clearBVHNodes();
+	#endif
+	
+	#ifdef COLLISION_BRUTE_FORCE
+	// Brute force search through bounding boxes
+	// It seems this method is a lot faster
+	for (int j = 0; j < models.length(); j++)
+	{
+		// For every single model, check collision with its bounding box
+		if (intersectsBoundingBox(ray, getMinBoundingPosition(j), getMaxBoundingPosition(j), t))
+		{
+			// DEBUG: Show the bounding box
+			// colour.y = 1.0f; // Set to green
+
+			// If the ray intersects with the bounding box, then check if minimum distance to it is smaller than the shortest distance found so far
+			if (t <= closestDistance)
+			{ 
+				// Then check for each set of 3 vertices of the model for collision
+				for (int i = models[j].verticesStartIndex; i < models[j].verticesEndIndex; i += 3) // Stride = 3 because 3 vertices per plane
+				{
+					// Check for intersection between ray and triangle
+					if (dot(ray.direction, normals[i].xyz) != 0) // Enforce that the ray can't hit the plane at 90/-270 degrees
+						intersectsTriangle(ray, vertices[i].xyz, vertices[i + 1].xyz, vertices[i + 2].xyz, t, testFrontFaceHit);
+					
+					// If a closest distance is found
+					// Small offset added to prevent intersecting the already intersected plane
+					if (t >= 0.005f && t < closestDistance)
+					{
+						// Update the closest distance and model
+						closestModel = j;
+						intersectedPlaneID = i;
+						closestDistance = t;
+						frontFacingTriangleHit = testFrontFaceHit;
+						// break; // TODO: Allowed iff acceleration structure divides planes effectively
+					}
+				}
+			}
+		}
+	}
+	#endif
+	
+	// If no collision -> closestModel stays -1
+	// Get the intersection point
+	if (closestModel != -1)
+		intersectionPoint = ray.position + ray.direction * closestDistance;
+}
+
+// ################# Ray generation functions
+/**
+	Given a normal vector, generate a random direction in
+	its hemisphere
+	From http://mathworld.wolfram.com/SpherePointPicking.html
+*/
+vec3 generateRandomDirectionInHemiSphere(vec3 intersectedPlaneNormal)
+{  
+	// Randomly generate a new direction in the hemisphere (pointing upwards with its y axis)
+	float theta = 2.0f * PI * RNG(); // [0, 2pi]
+	float u = 2.0f * RNG() - 1.0f; // [-1, 1]
+	while (u == 0)
+		u = 2.0f * RNG() - 1.0f; // Generated ray cannot be 90 degrees to normal
+	float term1 = pow(1.0f - u * u, 0.5f);
+	vec3 sampledDirection = normalize(vec3(term1 * cos(theta), term1 * sin(theta), u));
+
+	// Test cosine value between direction and intersectedPlaneNormal, if < 0 then invert direction
+	if (dot(sampledDirection, intersectedPlaneNormal) < 0)
+		sampledDirection = -sampledDirection;
+
+	return sampledDirection;
+}
+
+// ################# Fresnel/Schlick
+/**
+	---------------- Fresnel's Equations ----------------
+	For retrieving the reflectivity and transmitivity of a surface
+	n1 = From medium
+	n2 = To medium
+	d1 = Angle from normal
+	d2 = Refracted angle from normal
+
+	Assumes unpolarized light, so the mean average of the two Fresnel's equation
+	*/
+void fresnel(float n1, float n2, float d1, float d2, out float reflectivity, out float transmitivity)
+{
+	float reflectivityS = pow((n1 * cos(d1) - n2 * cos(d2)) / (n1 * cos(d1) + n2 * cos(d2)), 2);
+	float reflectivityP = pow((n1 * cos(d2) - n2 * cos(d1)) / (n1 * cos(d2) + n2 * cos(d1)), 2);
+
+	reflectivity = (reflectivityS + reflectivityP) / 2.0f;
+	transmitivity = (2 - reflectivityS - reflectivityP) / 2.0f;
+}
+    
+/**
+	Faster approximation to Fresnel's equations because light polarisation is not within scope of the project
+	For specular reflection of non-conducting surfaces
+	@param cosTheta = cosTheta between incident light and normal vector
+	@param n1 = incident medium
+	@param n2 = target medium
+	*/
+float schlick(float cosTheta, float n1, float n2)
+{
+	float r0 = pow((n1 - n2) / (n1 + n2), 2.0f);
+	return r0 + (1.0f - r0) * pow(1.0f - cosTheta, 5.0f);
+}
+
+// ################# BSDF evaluation functions
+float chi(float x) // Ensures positivity (Walter)
+{
+	if (x > 0) return 1.0f;
+	else return 0.0f;
+}
+
+/** Beckmann distribution function (Walter) */
+float beckmanD(vec3 i, vec3 m, vec3 n, float a)
+{
+	a = (1.2f - 0.2f * pow(dot(i, n), 0.5f)) * a;
+	float cosM = dot(m, n);
+	float cosM2 = cosM * cosM;
+	return chi(cosM) * pow(e, (cosM2 - 1.0f) / cosM2 / a / a) / (PI * a * a * cosM2 * cosM2);
+}
+
+/** Beckmann shadowing function (Walter) */
+float beckmannG1(vec3 v, vec3 m, vec3 n, float rms)
+{
+	// Following Walter's rational approximation to Smith G1 equation
+	if (chi(dot(v, halfVector(v, m)) / dot(v, n)) != 0)
+	{
+		float c = dot(n, v);
+		float a = c / (rms * pow(1 - c * c, 0.5f));
+		if (a < 1.6f)
+			return 3.535f * a + 2.181f * a * a / (1.0f + 2.276f * a + 2.577f * a * a);
+		else return 1.0f;
+	}
+	return 0.0f;
+}
+
+/** GGX distribution function in Walter's paper */
+float ggxD(vec3 m, vec3 n, float a)
+{
+	float c = dot(normalize(m), normalize(n));
+	float tanThetaM = sqrt(1.0f - c) / c;
+	if (chi(c) == 0)
+		return 0;
+	else return a * a / (PI * c * c * c * c * pow(a * a + tanThetaM * tanThetaM, 2));
+}
+
+/** 
+	GGX shadowing function in Walter's paper
+*/
+float ggxG1(vec3 v, vec3 m, vec3 n, float a)
+{
+	float tanTheta = tan(acos(dot(n, v)));
+	if (chi( dot(v, m) / dot(v, n) ) == 0)
+		return 0;
+	else return 2.0f / (1.0f + sqrt(1.0f + a * a * tanTheta * tanTheta));
+}
+
+float bsdfDistributionFunction(vec3 i, vec3 m, vec3 n, float rms)
+{
+	#ifdef BECKMANN_BSDF
+	return beckmanD(i, m, n, rms);
+	#endif
+	#ifdef GGX_BSDF
+	return ggxD(m, n, rms);
+	#endif
+	return 1.0f;
+}
+
+float bsdfGeometryShadowingFunction(vec3 v1, vec3 v2, vec3 m, vec3 n, float rms)
+{
+	#ifdef BECKMANN_BSDF
+	return beckmannG1(v1, m, n, rms) * beckmannG1(v2, m, n, rms);
+	#endif
+	#ifdef GGX_BSDF
+	return ggxG1(v1, m, n, rms) * ggxG1(v2, m, n, rms);
+	#endif
+	return 1.0f;
+}
+
+/** PDF for the BRDF */
+float brdfPDF(vec3 i, vec3 o, vec3 m, vec3 n, float rms)
+{
+	return bsdfDistributionFunction(i, m, n, rms) * abs(dot(m, n)) / (4.0f * abs(dot(o, m)));
+}
+
+/** PDF for the BTDF */
+float btdfPDF(vec3 i, vec3 o, vec3 m, vec3 n, float ni, float no, float rms)
+{
+	return bsdfDistributionFunction(i, m, n, rms) * abs(dot(m, n)) * no * no * abs(dot(o, m)) / pow(ni * dot(i, m) + no * dot(o, m), 2);
+}
+
+/**
+	n = macrosurface normal
+	m = microsurface normal
+	i = light direction
+	o = viewing/scattered direction
+	rms = root mean squared = roughness = [0, inf)
+*/
+float bsdfWeight(vec3 n, vec3 m, vec3 i, vec3 o, float rms)
+{
+	// Weight definition is BRSF * cosTheta / PDF
+	// The Fresnel term is cancelled in the macro
+	// Terms G and D are cancelled out by dividing by the PDF, as shown in Walter's paper
+	// This applies to both reflective and refractive terms
+	float geo = bsdfGeometryShadowingFunction(i, o, m, n, rms); // Shadow masking geometry
+	return abs(dot(i, m)) * geo / (abs(dot(i, n)) * abs(dot(m, n)));
+}
+
+/**
+	For sampling a BRDF to produce a microfacet given the normal and roughness
+	Creates a direction for a microfacet deviating from the given normal, depending on roughness.
+	Larger roughness = more deviation from normal
+	Part of importance sampling.
+	@n = Normal of the plane (normalized)
+*/
+vec3 sampleBRDF(vec3 n, float rms)
+{
+	// RNG used here is specified as [0, 1)
+	float r1 = RNGwithout1();
+	float theta, phi;
+
+	#ifdef BECKMANN_BSDF
+	theta = atan(sqrt(-rms * rms * log(1 - r1))); // Polar angle
+	phi = 2 * PI * RNGwithout1(); // Azimuthal angle
+	#endif
+	#ifdef GGX_BSDF
+	theta = atan(rms * pow(r1, 0.5) / pow(1 - r1, 0.5)); // Polar angle
+	phi = 2 * PI * RNGwithout1(); // Azimuthal angle
+	#endif
+	
+	// Create the new microfacet direction vector oriented at n
+	vec3 m = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+
+	// The rotational matrix below doesn't work for normals at (0, 0, -1)
+	// For this case, simply return the negative
+	if (n == vec3(0, 0, -1))
+		return normalize(-m);
+	
+	// Create the rotational matrix between (0, 0, 1) and n
+	// https://math.stackexchange.com/questions/180418/calculate-rotation-matrix-to-align-vector-a-to-vector-b-in-3d
+	float c = dot(vec3(0, 0, 1), n);
+
+	if (c == -1)
+		return normalize(m);
+
+	vec3 v = cross(vec3(0, 0, 1), n);
+	float s = length(v);
+	mat3 vx = mat3(0, -v[2], v[1], v[2], 0, -v[0], -v[1], v[0], 0);
+	mat3 r = mat3(1, 0, 0, 0, 1, 0, 0, 0, 1) + vx + vx * vx * (1 / (1 + c));
+
+	// Orient m at n
+	m = r * m;
+
+	return normalize(vec3(-m[0], -m[1], m[2])); // TODO: Not sure why I need to do this.
+}
+
+// ################# MIS weighted methods for selecting between light sampling and BRDF pdfs
+float MISSquareWeighted(float x, float y){return (x * x) / (x * x + y * y);}
+float MISWeighted(float x, float y){return x / (x + y);}
+float MISUniform(){return 0.5f;}
+
+// ################# Sampling lights functions
+/** Selects a light uniformly */
+float lightPDFUniform(int id){return 1.0f / float(lightSources.length());}
+float lightPDFWeightedDistance(int id){return 0.0f;}
+
+void selectLightUniformly(out int lightID, out float probability)
+{
+	lightID = lightSources[int(floor(RNGwithout1() * lightSources.length()))];
+	probability = lightPDFUniform(lightID); // constant
+}
+
+/** Selects a light using pdf of weighted distance */
+void selectLightByWeightedDistancePDF(vec3 p, out int lightID, out float probability)
+{
+	; // Not implemented
+}
+
+// ################# Direct light sampling related functions
+void castShadowRay(vec3 source, int targetLightSourceID, vec3 n, out Ray shadowRay, out vec3 lightIntersectionPoint, out int intersectedPlaneID, out int intersectedLightID, out float lightArea)
+{
+	shadowRay.position = source;
+	
+	// 1) Get largest possible radius around the object
+	float radius = getRadiusAroundBoundingBox(targetLightSourceID);
+
+	// 3) Create direction from the intersection point to the centre of model
+	vec3 lightSourceCentre = getCentrePosition(targetLightSourceID);
+	vec3 u = normalize(lightSourceCentre - source); // Direction to light source centre
+
+	// 4) Check if ray intersects model
+	int closestModel = -1;
+	intersectedPlaneID = -1;
+	bool isFrontFacingTriangleHit; // not used
+
+	// Do ray intersection for a number of times
+	// Doesn't always hit the light. Can be made up with:
+	// - Higher directLightSpp
+	// - Higher areaLightHitAttempts
+	// - Brighter light sources
+	for (int tries = areaLightHitAttempts; intersectedPlaneID != targetLightSourceID && tries > 0; tries--)
+	{
+		// 4.1) Generate random point on circle oriented in direction u with radius r
+		// WARNING: Not uniform
+		vec3 v = vec3(2 * RNG() - 1, 2 * RNG() - 1, 2 * RNG() - 1);
+		while (u == v) // Enforce u != v
+			v = vec3(2 * RNG() - 1, 2 * RNG() - 1, 2 * RNG() - 1);
+		v = normalize(cross(u, v)); // Obtain an orthogonal axis to u and v, this decides the rotation
+		float r = RNG() * radius; // Decide the distance from centre
+
+		// 4.2) Perform the ray collision test
+		shadowRay.direction = normalize(lightSourceCentre + v * r - source);
+		if (dot(shadowRay.direction, n) > 0) // Same side reflectance
+			rayCollisionTest(shadowRay, closestModel, intersectedPlaneID, lightIntersectionPoint, isFrontFacingTriangleHit);
+	}
+
+	// 4.2) If fail, test against centre of light source
+	// Removed because this method out performs random sampling -> no soft shadows apparent
+	// if (intersectedPlaneID != targetLightSourceID)
+	// {
+		// intersectedPlaneID = -1; closestModel = -1;
+		// shadowRay.direction = normalize(lightSourceCentre - source);
+		// if (dot(shadowRay.direction, n) > 0) // Same side reflectance
+			// rayCollisionTest(shadowRay, closestModel, intersectedPlaneID, lightIntersectionPoint, isFrontFacingTriangleHit);
+	// }
+	
+	intersectedLightID = closestModel;
+	
+	// Output the area
+	radius *= DISTANCE_METRIC;
+	lightArea = radius * radius * PI; // PI * r^2
+}
+
+/**
+	Direct light sampling using Next event estimation
+	Two rays are used here for direct lighting by multiple importance sampling
+	@p = Intersected point
+*/
+void neeDirectLightSampling(inout Ray ray, vec3 p, vec3 n, int intersectedModelID, bool isFrontFacingTriangleHit)
+{
+	/// If intersected light source is the only light source in the scene
+	if (lightSources.length() == 1 && lightSources[0] == intersectedModelID)
+		return;
+	
+	/// Sample lighting
+	// Prepare the variables
+	float lightPDF, bsdfPDF, dist;
+	int intersectedPlaneID = -1, intersectedLightID = -1;
+	vec3 lightIntersectionPoint;
+	Ray shadowRay;
+	int chosenLight;
+	float pl; // Probability of choosing the light source
+	
+	vec4 conductorColour = vec4(1);
+	if (models[intersectedModelID].material == 1)
+		conductorColour *= getModelColour(intersectedModelID);
+	
+	// Loop for all light sources
+	for (int i = 0; i < directLightSpp; i++)
+	{
+		// Importance sampling for choosing light to reduce overhead in sampling many lights in the scene at once
+		selectLightUniformly(chosenLight, pl);
+		// selectLightByWeightedDistancePDF(p, chosenLight, pl);
+		
+		while (chosenLight == intersectedModelID) // chosen light !=  intersected model itself
+			selectLightUniformly(chosenLight, pl);
+			// selectLightByWeightedDistancePDF(p, chosenLight, pl);
+			
+		// Cast shadow ray to light source and check for intersection
+		intersectedPlaneID = -1;
+		intersectedLightID = -1;
+		castShadowRay(p, chosenLight, n, shadowRay, lightIntersectionPoint, intersectedPlaneID, intersectedLightID, lightPDF);
+			
+			// Check that light is visible
+		if (intersectedLightID == chosenLight)
+		{
+			// Pdf = solid angle, which is also the weight because direct sampling
+			dist = distance(p, lightIntersectionPoint);
+			float solidAngle = getSolidAngle(lightPDF, dist) * dot(-shadowRay.direction, normals[intersectedPlaneID].xyz); // Calculate the solid angle weight
+			// if (solidAngle > 2 * PI) // Solid angle cannot exceed 2 PI
+			if (solidAngle > 1) // Set to 1 to avoid fireflies
+				solidAngle = 1;
+			
+			// If either shadow/normal ray is below surface
+			if (dot(shadowRay.direction, n) <= 0|| dot(-ray.direction, n) <= 0)
+			{
+				/// Specular component -> Ward GGX
+				// NEE direct transmissive light sampling
+				float ni = getLastIntersectedModelRefractiveIndex();
+				float no = defaultRefractiveIndex; // If light is hit from inside, then outside is not an object, but literally outside
+				
+				vec3 m = -(ni * shadowRay.direction + no * -ray.direction);
+				
+				vec3 test = refract(ray.direction, -n, ni/no);
+				
+				// If total reflection, ignore
+				if (length(test) == 0)
+					continue;
+				
+				bsdfPDF = btdfPDF(shadowRay.direction, -ray.direction, m, -n, ni, no, models[intersectedModelID].roughness); // BTDF
+				
+				ray.colour += models[intersectedModelID].transparentComponent
+							* models[chosenLight].lightStrength
+							* getModelColour(chosenLight)
+							* ray.weight
+							* solidAngle
+							* bsdfPDF
+							/ pl
+							/ directLightSpp
+							* ###CAUSTICS_CHEAT_CONSTANT###;
+				
+				continue; // Simply skip to next light source. Direct BRDF sampling not applicable.
+			}
+			
+			/// Specular component -> Ward GGX
+			// NEE direct specular light sampling
+			// Calculate MIS because sampled twice (once by this, once by BSDF)
+			bsdfPDF = brdfPDF(shadowRay.direction, -ray.direction, halfVector(-ray.direction, shadowRay.direction), n, models[intersectedModelID].roughness); // BRDF
+			ray.colourToBeAddedBsdfPDF = 1.0 / solidAngle;
+			ray.colourToBeAdded = models[intersectedModelID].specularComponent
+						* conductorColour // Take conductor colour if it's conductor
+						* getModelColour(chosenLight)
+						* models[chosenLight].lightStrength
+						* solidAngle
+						* ray.weight
+						* bsdfWeight(n, halfVector(-ray.direction, shadowRay.direction), shadowRay.direction, -ray.direction, models[intersectedModelID].roughness) * bsdfPDF // BRDF and cosTheta
+						/ pl
+						/ directLightSpp;
+			
+			/// Diffuse component -> Lambertian
+			lightPDF = 1.0 / solidAngle; // Lambert
+			if (lightPDF > 1) lightPDF = 1;
+			ray.colour += models[intersectedModelID].diffuseComponent
+						* getModelColour(intersectedModelID) // model value
+						* models[intersectedModelID].albedo / PI // Lambert
+						* getModelColour(chosenLight) // Light colour
+						* models[chosenLight].lightStrength // Radiance
+ 						* ray.weight // Path weight
+						* solidAngle // Weight factor
+						* dot(shadowRay.direction, n) // Lambert cosine law
+						/ pl // Chance of choosing light
+						/ directLightSpp; // Divide by the number of direct light samples
+		}
+	}
+}
+
+// ################# Indirect light sampling related functions
+/** 
+	m is passed as a parameter because of the case of total reflection during refraction
+	a = roughness
+*/
+void reflectSpecularRay(inout Ray ray, vec3 m, vec3 n, float ni, float nt, float rms)
+{
+	vec3 i = normalize(reflect(ray.direction, m)); // Reflected direction (Light incident direction)
+	ray.bsdfPDF = brdfPDF(i, -ray.direction, m, n, rms); // Record brdf pdf for nee
+	ray.weight *= bsdfWeight(n, m, i, -ray.direction, rms); // Weight of the ray
+	ray.direction = i;
+	ray.isSpecularRay = true;
+	
+	if (dot(ray.direction, n) <= RAY_DIR_CUTOFF_ANGLE) // The generated m causes impossible reflection
+	{
+		ray.weight *= 0;
+		return;
+	}
+}
+
+void reflectDiffuseRay(inout Ray ray, vec3 n, int intersectedModelID)
+{
+	// Update the ray direction with a random direction in hemisphere
+	ray.direction = generateRandomDirectionInHemiSphere(n);
+	
+	ray.bsdfPDF = 1.0 / 2.0 / PI; // Lambertian pdf for nee
+	
+	ray.isSpecularRay = false;
+	
+	// Update weight as: albedo * Lambertian BRDF (normalized) * cosTheta * Diffuse model colour / pdf
+	// = albedo * (model_colour / PI) * cosTheta / (1 / 2PI)
+	// = 2 * albedo * cosTheta * model_colour
+	ray.weight *= 2.0f * models[intersectedModelID].albedo * dot(n, ray.direction) * getModelColour(intersectedModelID);
+	
+	if (dot(ray.direction, n) <= RAY_DIR_CUTOFF_ANGLE) // The generated m causes impossible reflection
+	{
+		ray.weight *= 0;
+		return;
+	}
+}
+
+void refractSpecularRay(inout Ray ray, vec3 i, vec3 m, vec3 n, float ni, float nt, float rms)
+{
+	i = normalize(i);
+	ray.bsdfPDF = btdfPDF(i, -ray.direction, m, n, ni, nt, rms); // Record btdf pdf for nee
+	ray.weight *= bsdfWeight(n, m, i, -ray.direction, rms); // Weight of the ray
+	ray.direction = i;
+	ray.isSpecularRay = false;
+}
+
+vec4 beersLaw(int id, float distance)
+{
+	vec3 objectAbsorption = vec3(models[id].absorption[0], models[id].absorption[1], models[id].absorption[2]);
+	return vec4(exp(-objectAbsorption * distance * DISTANCE_METRIC), 1);
+}
+
+// ################# Core top level path tracing functions
+/** Handles the casting of the ray, direct lighting, and reflection/transmission of the ray */
+bool tracePath(inout Ray ray, int depth)
+{
+	/// 1) Shoot ray and test for collisions
+	int closestModel = -1, intersectedPlaneID = -1;
+	vec3 intersectionPoint;
+	bool isFrontFacingTriangleHit;
+	rayCollisionTest(ray, closestModel, intersectedPlaneID, intersectionPoint, isFrontFacingTriangleHit);
+	
+	/// 2) Hit nothing: Return background colour/sky box
+	if (closestModel == -1)
+		return true;
+	// ray.colour = getModelColour(closestModel); return true; // Debug intersection
+	
+	// Calculating and update distance for attenuation
+	float distanceTravelled = distance(ray.position, intersectionPoint);
+	ray.refractedDistance += distanceTravelled;
+	ray.position = intersectionPoint; // Update intersection point for the ray
+	vec3 intersectedPlaneNormal = normalize(normals[intersectedPlaneID].xyz); // Get the normal of the plane hit
+	// ray.colour = vec4(intersectedPlaneNormal, 1); return true; // Debug normals are on the correct side
+	
+	/// 3) Add light emittance if light source and specular ray
+	if (models[closestModel].lightStrength > 0) // With NEE
+	{
+		vec4 Le = getModelColour(closestModel) * models[closestModel].lightStrength;
+		if (depth == 0)
+			ray.colour += Le;
+		else if (ray.isSpecularRay)
+		{
+			// Specular lighting
+			// Non MIS
+			// if (ray.isSpecularRay)
+				// ray.colour += ray.weight * Le; // BRDF sampling
+			// ray.colour += ray.colourToBeAdded; // Direct light sampling
+			
+			/// MIS
+			float MIS;
+			MIS = MISSquareWeighted(ray.bsdfPDF, ray.colourToBeAddedBsdfPDF); 
+			ray.colour += ray.weight * Le * MIS; // NEE BRDF sampling
+			MIS = MISSquareWeighted(ray.colourToBeAddedBsdfPDF, ray.bsdfPDF); 
+			ray.colour += ray.colourToBeAdded * MIS; // NEE direct sampling
+		}
+			
+	}
+	
+	/// 4) Next event estimation: Direct light sampling
+	ray.colourToBeAdded *= 0; // Represents specular colour to be added with MIS next round. If ray terminates before then, add this to ray.colour.
+	ray.colourToBeAddedBsdfPDF = 0;
+	neeDirectLightSampling(ray, intersectionPoint, intersectedPlaneNormal, closestModel, isFrontFacingTriangleHit);
+	
+	// NOTE:
+	// ray.colour += ray.colourToBeAdded;
+	
+	/// 5) Compute the next ray direction
+	// Get refractive index of incident and target material
+	float ni = getLastIntersectedModelRefractiveIndex(); // incident refractive index
+	float nt = models[closestModel].refractiveIndex; // target refractive index
+	if (isFrontFacingTriangleHit)
+	{
+		// Front face hit
+		float fresnel = schlick(dot(-ray.direction, intersectedPlaneNormal), ni, nt);
+		float probability = RNGwithout1();
+		
+		// Select diffuse, specular and transparency randomly and importance sample
+		if (probability < 1.0 / 3.0)
+		{
+			// Diffuse ray chosen
+			if (models[closestModel].diffuseComponent <= 0)
+			{
+				ray.colour += ray.colourToBeAdded;
+				return true;
+			}
+			
+			ray.weight *= 3 * models[closestModel].diffuseComponent * getModelColour(closestModel);
+			
+			reflectDiffuseRay(ray, intersectedPlaneNormal, closestModel);
+		}
+		else if (probability < 2.0 / 3.0)
+		{
+			// Specular ray chosen
+			if (models[closestModel].specularComponent <= 0)
+			{
+				ray.colour += ray.colourToBeAdded;
+				return true;
+			}
+			
+			ray.weight *= 3 * models[closestModel].specularComponent;
+			vec3 m = sampleBRDF(intersectedPlaneNormal, models[closestModel].roughness);
+			reflectSpecularRay(ray, m, intersectedPlaneNormal, ni, nt, models[closestModel].roughness);
+			
+			// If the material is a conductor, take on the material colour
+			if (models[closestModel].material == 1)
+				ray.weight *= getModelColour(closestModel);
+		}
+		else
+		{
+			// Transparent ray chosen
+			if (models[closestModel].transparentComponent <= 0)
+			{
+				ray.colour += ray.colourToBeAdded;
+				return true;
+			}
+			
+			ray.weight *= 3 * models[closestModel].transparentComponent;
+			
+			// Test against fresnel/schlick
+			// Macro for fresnel not needed because fresnel is folded in probability, and in dividing it would produce 1. So no action needed.
+			if ((probability = RNGwithout1()) < fresnel)
+			{
+				// Reflect specular ray
+				vec3 m = sampleBRDF(intersectedPlaneNormal, models[closestModel].roughness);
+				reflectSpecularRay(ray, m, intersectedPlaneNormal, ni, nt, models[closestModel].roughness);
+			}
+			else
+			{
+				// Specular transmitted ray
+				vec3 m = sampleBRDF(intersectedPlaneNormal, models[closestModel].roughness);
+				vec3 i = refract(ray.direction, m, ni/nt);
+					
+				if (length(i) == 0) // Total internal reflection
+				{
+					reflectSpecularRay(ray, m, intersectedPlaneNormal, ni, nt, models[closestModel].roughness);
+				}
+				else
+				{
+					// Refract into object
+					storeIntersectedModel(closestModel);
+					refractSpecularRay(ray, i,  m, intersectedPlaneNormal, ni,  nt, models[closestModel].roughness);
+					ray.weight *= getModelColour(closestModel); // Get object's colour
+					ray.refractedDistance = 0.0f;
+				}
+			}
+		}
+	}
+	else 
+	{
+		// Back face hit
+		if (models[closestModel].material == 0 && models[closestModel].transparentComponent > 0)
+		{
+			// Dielectric and is transparent
+			// Test against fresnel/schlick
+			float fresnel = schlick(dot(-ray.direction, -intersectedPlaneNormal), ni, nt);
+			if (RNGwithout1() < fresnel)
+			{
+				// Reflect specular ray
+				vec3 m = sampleBRDF(-intersectedPlaneNormal, models[closestModel].roughness);
+				reflectSpecularRay(ray, m, -intersectedPlaneNormal, ni, nt, models[closestModel].roughness);
+			}
+			else
+			{
+				// Refracted ray
+				vec3 m = sampleBRDF(-intersectedPlaneNormal, models[closestModel].roughness);
+				vec3 i = refract(ray.direction, m, ni/nt);
+				if (length(i) == 0)
+				{
+					// Total internal reflection
+					reflectSpecularRay(ray, m, -intersectedPlaneNormal, ni, nt, models[closestModel].roughness);
+				}
+				else
+				{
+					// Refract away from object
+					if (getLastIntersectedModel() != -1) // Test if current refraction outwards is expected.
+						removeLastIntersectedModel();
+					else ray.colour *= getModelColour(closestModel); // If not, then we must be rendering from inside an object. Take on the object's colour
+					refractSpecularRay(ray, i,  m, -intersectedPlaneNormal, ni,  nt, models[closestModel].roughness);
+				}
+				
+				// Regardless of reflection or refraction, beer's law applies
+				ray.weight *= beersLaw(closestModel, ray.refractedDistance);
+				ray.refractedDistance = 0.0f; // Reset the ray refractedDistance
+			}
+		}
+		else 
+		{
+			ray.colour += ray.colourToBeAdded;
+			return true; // Conductors can't be transparent
+		}
+	}
+	
+	
+	/// 6) Russian roulette
+	// Adapted from https://computergraphics.stackexchange.com/questions/2316/is-russian-roulette-really-the-answer
+	if (russian_roulette == 1)
+	{
+		float p = ###RUSSIAN_ROULETTE_CONSTANT###f / max(ray.weight[0], max(ray.weight[1], ray.weight[2]));
+		if (RNG() < p)
+		{
+			ray.colour += ray.colourToBeAdded;
+			return true; // Terminate ray
+		}
+		ray.weight /= 1 - p; // Redistribute cut off power
+	}
+	
+	// DEBUG: Ray direction
+	// ray.colour = vec4(ray.direction, 1);
+	
+	// DEBUG: Which object did the ray last hit
+	// ray.colour = getModelColour(closestModel);
+	
+	// If weight is 0, then nothing to be done
+	if (dot(ray.weight, vec4(1.0f)) == 0 || ray.bsdfPDF < EPSILON)
+		return true;
+	else return false; // Loop
+}
+
+/** Get camera ray method */
+Ray getCameraRay()
+{
+	// Produces a ray from the camera to the pixel assigned for the current shader invocation
+	Ray ray;
+	
+	// 1) Get the pixel on the screen
+	vec3 pixelCoordinates = vec3(gl_GlobalInvocationID.xy, 0);
+	
+	// Naive anti-aliasing
+	pixelCoordinates.x += 1.5f * RNG() - 0.75f; pixelCoordinates.y += 1.5f * RNG() - 0.75f;
+	
+	// 2) Create vector from camera to the pixel
+	ray.direction = pixelCoordinates - camera.viewerPosition;
+	
+	// 3) Rotate the vector around the origin accordingly
+	ray.direction = normalize((vec4(ray.direction, 1) * camera.cameraRotation).xyz);
+	
+	// 4) Get camera position for the ray
+	ray.position = camera.cameraPosition;
+	
+	// 5) Set the other ray variables
+	ray.colour = vec4(0, 0, 0, 1);
+	ray.colourToBeAdded = vec4(0);
+	ray.weight = vec4(1); // Starts at 100%
+	ray.refractedDistance = 0.0f;
+	ray.bsdfPDF = 1;
+	ray.colourToBeAddedBsdfPDF = 0;
+	ray.isSpecularRay = false;
+
+	return ray;
+}
+
+/** Main method */
+void main()
+{
+	// Get the pixel coordinates
+	ivec2 pixelCoordinates = ivec2(gl_GlobalInvocationID.xy);
+	
+	// Initialise local variables here
+	clearBVHNodes();
+	// If the sampleNumber is 0 then the colour is black
+	vec4 colour;
+	if (settings.sampleNumber == 1)
+		colour = vec4(0, 0, 0, 1);
+	else // Else load from previous image output
+		colour = imageLoad(imageOutput, pixelCoordinates);
+	
+	// Enforced debugging
+	// if (colour == vec4(1, 0, 1, 1) || colour == vec4(1, 0, 0, 1))
+	// {
+		// imageStore(imageOutput, pixelCoordinates, colour);
+		// return;
+	// }
+	
+	// Set the random seed to the worker group ID, camera position and direction
+	seed = dot(camera.cameraPosition, (vec4(vec3(gl_GlobalInvocationID.xy, 0) - camera.viewerPosition, 1) * camera.cameraRotation).xyz);
+	seed += int(seed * RNG() + settings.sampleNumber) % 22549;
+	seed += settings.sampleNumber * RNG() + settings.startingSeed;
+	
+	// Debug RNG
+	// imageStore(imageOutput, pixelCoordinates, vec4(RNG())); return;
+	
+	// Get the camera ray
+	Ray ray = getCameraRay();
+	
+	/// DEBUG: Bounding boxes for BVH
+	// vec4 addedColour = vec4(0, 2.0 / bvhNodes.length(), 0, 0);
+	// float dump;
+	// for (int i = 0; i < bvhNodes.length(); i++)
+	// {
+		// if (intersectsBoundingBox(ray, getBVHNodeMinBoundingPosition(i), getBVHNodeMaxBoundingPosition(i), dump))
+			// ray.colour += addedColour;
+	// }
+	// ray.colour[3] = 1;
+	// imageStore(imageOutput, pixelCoordinates, ray.colour);
+	// return;
+	
+	// Initialize all intersected model values to -1 (no model found)
+	for (int i = 0; i < treeSearchDepth; i++)
+		bvhNodesToExplore[i] = BVHNodeEntry(-1, -1);
+	for (int i = 0; i < maxDepth; i++)
+		intersectedModels[i] = -1;
+
+	// Loop through all depth
+	for (int i = 0; i < maxDepth; i++)
+	{
+		// Trace ray
+		if (tracePath(ray, i))
+			break;
+	}
+
+	
+	/// Safety check if the colour is NaN/Inf -> If so then discard
+	if (isnan(ray.colour.r) || isnan(ray.colour.g) || isnan(ray.colour.b))
+		ray.colour = vec4(0, 0, 0, 1);
+	else if (isinf(ray.colour.r) || isinf(ray.colour.g) || isinf(ray.colour.b))
+		ray.colour = vec4(0, 0, 0, 1);
+	
+	///  Average all samples to obtain the output colour
+	// Live update
+	if (settings.sampleNumber == 1) // If first time, simply the collected colour
+		colour = ray.colour;
+	else colour = ( (colour * (settings.sampleNumber - 1)) + ray.colour) / settings.sampleNumber;
+	
+	// Normal update
+	// colour += ray.colour / settings.totalSampleNumber;
+	
+	// Clamp final colour
+	colour = clamp(colour, vec4(0, 0, 0, 1), vec4(1, 1, 1, 1));
+	
+	// Finally store the pixel colour
+	imageStore(imageOutput, pixelCoordinates, colour);
+}
